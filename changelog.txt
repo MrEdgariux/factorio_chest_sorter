@@ -1,0 +1,26 @@
+---------------------------------------------------------------------------------------------------
+Version: 1.1.0
+Date: 2026-05-20
+  Features:
+    - Added a custom GUI for request rules with item, min, and max counts.
+    - Replaced the logistics-request bridge with direct chest-area refills.
+  Changes:
+    - Removed the logistics bridge research.
+    - Removed request setting.
+---------------------------------------------------------------------------------------------------
+Version: 1.0.0
+Date: 2025-08-23
+  Major Features:
+    - Added research for item bridge
+    - Added setting to be able to toggle bridge
+    - Using logistics inside player inventory you can receive items from chest areas if they are available
+    - Using item (e.g conveyor belt) it will be refilled inside the cursor rather inside inventory.
+  Balancing:
+    - Instead of timers, we now use events for performance and speed reasons.
+---------------------------------------------------------------------------------------------------
+Version: 0.1.1
+Date: 2025-08-12
+  Bugfixes:
+    - Changelog & Short description changes.
+  Features:
+    - Now instead of taking first chest, it takes the chest that has most slots. (Works with modded too)
