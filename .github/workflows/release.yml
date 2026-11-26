@@ -1,0 +1,138 @@
+name: Release mod package
+
+# Runs when changes land on main (for example when a pull request is merged).
+# It can also be started manually from the Actions tab.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish mod package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read mod metadata
+        id: meta
+        run: |
+          set -euo pipefail
+
+          name=$(jq -r '.name' info.json)
+          version=$(jq -r '.version' info.json)
+          factorio_version=$(jq -r '.factorio_version' info.json)
+
+          if [ -z "$name" ] || [ "$name" = "null" ]; then
+            echo "::error file=info.json::Missing mod name"
+            exit 1
+          fi
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error file=info.json::Missing mod version"
+            exit 1
+          fi
+
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "factorio_version=$factorio_version" >> "$GITHUB_OUTPUT"
+          echo "folder=${name}_${version}" >> "$GITHUB_OUTPUT"
+          echo "archive=${name}_${version}.zip" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate mod files
+        run: |
+          set -euo pipefail
+
+          for file in info.json control.lua data.lua settings.lua changelog.txt; do
+            if [ ! -f "$file" ]; then
+              echo "::error file=$file::$file is missing"
+              exit 1
+            fi
+          done
+
+          for dir in locale scripts; do
+            if [ ! -d "$dir" ]; then
+              echo "::error::$dir/ is missing"
+              exit 1
+            fi
+          done
+
+      - name: Build package
+        run: |
+          set -euo pipefail
+
+          folder="${{ steps.meta.outputs.folder }}"
+          archive="${{ steps.meta.outputs.archive }}"
+
+          rm -rf dist
+          mkdir -p "dist/$folder"
+
+          # Copy only the mod files. The zip must contain the folder
+          # <name>_<version>/ at its root for mods.factorio.com.
+          rsync -a \
+            --exclude='/.git/' \
+            --exclude='/.github/' \
+            --exclude='/dist/' \
+            --exclude='/build/' \
+            --exclude='/*.zip' \
+            ./ "dist/$folder/"
+
+          test -f "dist/$folder/info.json"
+
+          rm -f "$archive"
+          (cd dist && zip -r -q "../$archive" "$folder")
+
+          echo "::group::Package contents"
+          unzip -l "$archive"
+          echo "::endgroup::"
+
+      - name: Upload package as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.archive }}
+          path: ${{ steps.meta.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Chest Sorter ${{ steps.meta.outputs.version }}
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: ${{ steps.meta.outputs.archive }}
+          body: |
+            Mod package for Factorio ${{ steps.meta.outputs.factorio_version }}.
+
+            **Download:** `${{ steps.meta.outputs.archive }}`
+
+            The zip contains `${{ steps.meta.outputs.folder }}/` at its root, so it can be
+            uploaded directly to the mod portal as version `${{ steps.meta.outputs.version }}`.
+
+            Built from commit `${{ github.sha }}`.
+
+      - name: Write job summary
+        run: |
+          {
+            echo "### Mod package ready"
+            echo ""
+            echo "- Mod: \`${{ steps.meta.outputs.name }}\`"
+            echo "- Version: \`${{ steps.meta.outputs.version }}\`"
+            echo "- Factorio: \`${{ steps.meta.outputs.factorio_version }}\`"
+            echo "- Archive: \`${{ steps.meta.outputs.archive }}\`"
+            echo ""
+            echo "Download it from the release below, then upload it to mods.factorio.com."
+            echo ""
+            echo "> If this version already exists on the mod portal, bump \`version\` in \`info.json\` before merging."
+          } >> "$GITHUB_STEP_SUMMARY"

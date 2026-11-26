@@ -12,7 +12,6 @@ local CLOSE_BUTTON_NAME = "sorter-mod-request-close"
 local MAX_RULE_AMOUNT = 100000
 
 local function ensure_storage()
-  storage = storage or {}
   storage.requests = storage.requests or {}
   storage.requests_next_id = storage.requests_next_id or 0
   storage.requests_last_full_scan_tick = storage.requests_last_full_scan_tick or {}

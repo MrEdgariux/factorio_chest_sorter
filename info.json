@@ -1,10 +1,10 @@
 {
     "name": "chest_sorter",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "title": "Chest Sorter",
     "author": "MrEdgariux",
     "description": "Sorts items from chests to selected area with click of the button.",
-    "factorio_version": "2.0",
+    "factorio_version": "2.1",
     "dependencies": [
         "base"
     ]

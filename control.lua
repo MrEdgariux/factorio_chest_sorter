@@ -1,9 +1,5 @@
--- Chest Sorter — control.lua (Factorio 2.0)
+-- Chest Sorter — control.lua (Factorio 2.1)
 -- Final: event-driven, optimized, with trash->areas auto-dump and request refills.
-
--- === 2.0 storage/global alias =============================================
-if storage and not global then global = storage end
-if global and not storage then storage = global end
 
 ChestSorter = ChestSorter or {}
 local Requests
@@ -472,12 +468,21 @@ local function find_or_make_target(pools, item_name, source_chest, player, allow
   return nil
 end
 
-local function move_some(stack, dst, name)
+local function move_some(stack, dst)
   if not (stack and stack.valid_for_read) then return 0 end
-  local count = stack.count
-  if count <= 0 then return 0 end
+  if stack.count <= 0 then return 0 end
   local inv = dst.get_inventory(defines.inventory.chest)
   if not (inv and inv.valid) then return 0 end
+
+  -- Factorio 2.1: transfer_from_stack moves items while preserving quality,
+  -- tags, durability, ammo and spoil percentage.
+  if inv.transfer_from_stack then
+    return inv.transfer_from_stack(stack)
+  end
+
+  -- Fallback for versions without transfer_from_stack.
+  local name = stack.name
+  local count = stack.count
   local can = inv.get_insertable_count(name)
   if can <= 0 then return 0 end
   local put = math.min(count, can)
@@ -702,8 +707,13 @@ local function sort_from_source(player, source)
           player.print({"message.no-target", name})
           break
         end
-        local inserted = move_some(stack, dst, name)
-        if inserted > 0 then moved_stacks = moved_stacks + 1 end
+        local inserted = move_some(stack, dst)
+        if inserted > 0 then
+          moved_stacks = moved_stacks + 1
+        else
+          -- The destination reported space but accepted nothing; stop to avoid a loop.
+          break
+        end
       end
     end
   end
@@ -731,7 +741,7 @@ local function dump_trash_to_areas(player)
       local name = stack.name
       local dst = find_or_make_target(pools, name, nil, player, allow_place)
       if not dst then break end
-      move_some(stack, dst, name)
+      if move_some(stack, dst) <= 0 then break end
     end
   end
 end
