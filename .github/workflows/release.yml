@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     name: Build and publish mod package
@@ -129,4 +133,6 @@ jobs:
             echo "- Archive: \`${{ steps.meta.outputs.archive }}\`"
             echo ""
             echo "Download it from the release below, then upload it to mods.factorio.com."
+            echo ""
+            echo "> If this version already exists on the mod portal, bump \`version\` in \`info.json\` before merging."
           } >> "$GITHUB_STEP_SUMMARY"
