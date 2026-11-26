@@ -1,4 +1,12 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.1.1
+Date: 2026-05-24
+  Bugfixes:
+    - Fixed the issue with lags (now uses tick delay instead of instant)
+    - Fixed the issue with items not being refilled when the chest is empty.
+    - Fixed the issue with items losing their metadata when being through inventories.
+    - Fixed the issue with "y" keybind telling no area selected.
+---------------------------------------------------------------------------------------------------
 Version: 1.1.0
 Date: 2026-05-20
   Features:

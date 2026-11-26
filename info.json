@@ -1,6 +1,6 @@
 {
     "name": "chest_sorter",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "title": "Chest Sorter",
     "author": "MrEdgariux",
     "description": "Sorts items from chests to selected area with click of the button.",
