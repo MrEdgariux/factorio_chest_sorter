@@ -3,7 +3,7 @@ data:extend({
     type = "selection-tool",
     name = "sorter-mod-area-tool",
     icon = "__base__/graphics/icons/blueprint.png",
-    icon_size = 64, icon_mipmaps = 4,
+    icon_size = 64,
     subgroup = "tool",
     order = "z[sorter]-a[selection-tool]",
     stack_size = 1,
