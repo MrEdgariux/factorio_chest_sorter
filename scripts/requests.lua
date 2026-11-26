@@ -486,14 +486,22 @@ function Requests.on_gui_click(e)
 
   if element.name == ADD_BUTTON_NAME then
     set_rule_from_editor(player, get_rules(player))
-    Requests.process(player, true)
+    if ChestSorter and ChestSorter.queue_request_refresh then
+      ChestSorter.queue_request_refresh(player, nil, true)
+    elseif Requests.process then
+      Requests.process(player, true)
+    end
     return
   end
 
   local delete_rule_id = element.name:match("^sorter%-mod%-request%-delete%-(%d+)$")
   if delete_rule_id then
     delete_rule(player, tonumber(delete_rule_id))
-    Requests.process(player, true)
+    if ChestSorter and ChestSorter.queue_request_refresh then
+      ChestSorter.queue_request_refresh(player, nil, true)
+    elseif Requests.process then
+      Requests.process(player, true)
+    end
   end
 end
 
@@ -530,7 +538,11 @@ function Requests.on_gui_elem_changed(e)
       set_fields_to_item_stack_size(min_field, max_field, item_name)
     end
     update_rule_from_fields(player, tonumber(rule_id))
-    Requests.process(player, true)
+    if ChestSorter and ChestSorter.queue_request_refresh then
+      ChestSorter.queue_request_refresh(player, nil, true)
+    elseif Requests.process then
+      Requests.process(player, true)
+    end
   end
 end
 
@@ -544,7 +556,11 @@ function Requests.on_gui_text_changed(e)
   local rule_id = element.name:match("^sorter%-mod%-request%-min%-(%d+)$") or element.name:match("^sorter%-mod%-request%-max%-(%d+)$")
   if rule_id then
     update_rule_from_fields(player, tonumber(rule_id), false)
-    Requests.process(player, true)
+    if ChestSorter and ChestSorter.queue_request_refresh then
+      ChestSorter.queue_request_refresh(player, nil, true)
+    elseif Requests.process then
+      Requests.process(player, true)
+    end
   end
 end
 

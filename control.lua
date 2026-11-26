@@ -8,10 +8,16 @@ if global and not storage then storage = global end
 ChestSorter = ChestSorter or {}
 local Requests
 
+local REQUEST_REFRESH_FULL_DELAY_TICKS = 12
+local REQUEST_REFRESH_ITEM_DELAY_TICKS = 1
+
 -- === Init / migrations ======================================================
 script.on_init(function()
   storage.areas = storage.areas or {}                  -- [player_index] = { list = { {area=..., surface_index=...}, ... } }
   storage.trash_guard = storage.trash_guard or {}      -- [player_index] = last_tick processed (re-entrancy guard)
+  storage.chest_cache = storage.chest_cache or {}      -- [player_index] = { known = { [unit_number] = entity, ... }, dirty = bool }
+  storage.requests_queue = storage.requests_queue or {} -- [player_index] = { due_tick = ..., full = bool, item_name = string?, force = bool }
+  storage.cursor_refresh_guard = storage.cursor_refresh_guard or {} -- [player_index][item_name] = last_tick (re-entrancy guard)
   if Requests and Requests.on_init then
     Requests.on_init()
   end
@@ -20,6 +26,9 @@ end)
 script.on_configuration_changed(function()
   storage.areas = storage.areas or {}
   storage.trash_guard = storage.trash_guard or {}
+  storage.chest_cache = storage.chest_cache or {}
+  storage.requests_queue = storage.requests_queue or {}
+  storage.cursor_refresh_guard = storage.cursor_refresh_guard or {}
   if Requests and Requests.on_configuration_changed then
     Requests.on_configuration_changed()
   end
@@ -71,6 +80,165 @@ local function find_area_for_entity(areas, entity)
   end
 end
 
+local function ensure_player_chest_cache(player)
+  storage.chest_cache = storage.chest_cache or {}
+  local bucket = storage.chest_cache[player.index]
+  if not bucket then
+    bucket = { known = {}, dirty = true }
+    storage.chest_cache[player.index] = bucket
+  end
+  bucket.known = bucket.known or {}
+  return bucket
+end
+
+local function ensure_request_queue(player)
+  storage.requests_queue = storage.requests_queue or {}
+  local bucket = storage.requests_queue[player.index]
+  if not bucket then
+    bucket = { due_tick = 0, full = false, item_name = nil, force = false }
+    storage.requests_queue[player.index] = bucket
+  end
+  return bucket
+end
+
+local function queue_request_refresh(player, item_name, force)
+  if not (player and player.valid and player.character) then return end
+
+  local bucket = ensure_request_queue(player)
+  bucket.force = bucket.force or force == true
+
+  if type(item_name) == "string" and item_name ~= "" then
+    if bucket.full then
+      return
+    end
+    if bucket.item_name == nil then
+      bucket.item_name = item_name
+    elseif bucket.item_name ~= item_name then
+      bucket.item_name = nil
+      bucket.full = true
+    end
+    if not bucket.full then
+      -- Item-specific: schedule soon and never push the deadline later while placing.
+      local new_due = game.tick + REQUEST_REFRESH_ITEM_DELAY_TICKS
+      bucket.due_tick = bucket.due_tick and math.min(bucket.due_tick, new_due) or new_due
+      return
+    end
+  end
+
+  bucket.item_name = nil
+  bucket.full = true
+  bucket.due_tick = game.tick + REQUEST_REFRESH_FULL_DELAY_TICKS
+end
+
+local function flush_request_refresh_queue()
+  local queue = storage.requests_queue
+  if not queue then return end
+
+  for player_index, bucket in pairs(queue) do
+    if bucket and bucket.due_tick and bucket.due_tick <= game.tick then
+      local player = game.get_player(player_index)
+      if player and player.valid and player.character and Requests then
+        if bucket.full or not bucket.item_name then
+          if Requests.process then
+            Requests.process(player, bucket.force)
+          end
+        elseif Requests.process_item then
+          Requests.process_item(player, bucket.item_name, bucket.force)
+        elseif Requests.process then
+          Requests.process(player, bucket.force)
+        end
+      end
+      queue[player_index] = nil
+    end
+  end
+end
+
+script.on_nth_tick(1, flush_request_refresh_queue)
+
+local function mark_player_chest_cache_dirty(player)
+  local bucket = ensure_player_chest_cache(player)
+  bucket.known = {}
+  bucket.dirty = true
+end
+
+local function is_cacheable_chest(e)
+  if not (e and e.valid) then return false end
+  if e.type ~= "container" and e.type ~= "logistic-container" then return false end
+  return e.get_inventory(defines.inventory.chest) ~= nil
+end
+
+local collect_area_chests_in_areas
+
+local function bootstrap_player_chest_cache(player)
+  local bucket = ensure_player_chest_cache(player)
+  local areas = get_player_areas(player)
+  local known = {}
+
+  if areas then
+    for _, chest in ipairs(collect_area_chests_in_areas(player, areas)) do
+      if chest and chest.valid and chest.unit_number then
+        known[chest.unit_number] = chest
+      end
+    end
+  end
+
+  bucket.known = known
+  bucket.dirty = false
+  return bucket
+end
+
+local function cache_chest_for_player(player, chest)
+  if not (player and player.valid and chest and chest.valid and chest.unit_number) then return end
+  if not is_cacheable_chest(chest) then return end
+
+  local areas = get_player_areas(player)
+  if not areas or not find_area_for_entity(areas, chest) then return end
+
+  local bucket = ensure_player_chest_cache(player)
+  bucket.known[chest.unit_number] = chest
+end
+
+local function forget_chest_from_all_caches(chest)
+  if not (chest and chest.valid and chest.unit_number and storage.chest_cache) then return end
+
+  local unit_number = chest.unit_number
+  for _, bucket in pairs(storage.chest_cache) do
+    if bucket and bucket.known then
+      bucket.known[unit_number] = nil
+    end
+  end
+end
+
+local function get_cached_area_chests(player, areas, exclude_entity)
+  local bucket = ensure_player_chest_cache(player)
+  if bucket.dirty then
+    bootstrap_player_chest_cache(player)
+  end
+
+  areas = areas or get_player_areas(player)
+  if not areas then return {} end
+
+  local chests = {}
+  local known = bucket.known or {}
+  for unit_number, chest in pairs(known) do
+    if not (chest and chest.valid and chest.unit_number == unit_number) then
+      known[unit_number] = nil
+    elseif chest ~= exclude_entity and chest.force == player.force then
+      local area = find_area_for_entity(areas, chest)
+      if not area then
+        known[unit_number] = nil
+      else
+        local inv = chest.get_inventory(defines.inventory.chest)
+        if inv and inv.valid then
+          chests[#chests + 1] = chest
+        end
+      end
+    end
+  end
+
+  return chests
+end
+
 local function player_main_inventory(player)
   if player and player.valid and player.character then
     return player.get_main_inventory()
@@ -90,6 +258,9 @@ end
 
 -- === Areas: find chests & grid placement ===================================
 local CELL_W, CELL_H = 1, 1
+local EXCLUDED_CHEST_ITEM_NAMES = {
+  ["memory-unit"] = true,
+}
 
 local function with_grid(area, fn)
   local x0 = math.floor(area.left_top.x)
@@ -125,11 +296,12 @@ end
 
 local function is_chest_entity(e)
   if not (e and e.valid) then return false end
-  return (e.type == "container") and e.get_inventory(defines.inventory.chest) ~= nil
+  if e.type ~= "container" and e.type ~= "logistic-container" then return false end
+  return e.get_inventory(defines.inventory.chest) ~= nil
 end
 
 -- Collect all simple chests inside player's areas (all surfaces), de-duplicated
-local function collect_area_chests_in_areas(player, areas, exclude_entity)
+collect_area_chests_in_areas = function(player, areas, exclude_entity)
   if not areas then return {} end
   local chests, seen = {}, {}
   for _,rec in ipairs(areas) do
@@ -153,9 +325,7 @@ local function collect_area_chests_in_areas(player, areas, exclude_entity)
 end
 
 local function collect_area_chests(player)
-  local areas = get_player_areas(player)
-  if not areas then return {} end
-  return collect_area_chests_in_areas(player, areas)
+  return get_cached_area_chests(player)
 end
 
 -- Pick the highest-capacity chest item from player's inventory (supports modded chests)
@@ -164,7 +334,7 @@ local function pick_best_chest_from_inventory(inv)
   local best, best_slots = nil, -1
   for i = 1, #inv do
     local stack = inv[i]
-    if stack and stack.valid_for_read and stack.count > 0 then
+    if stack and stack.valid_for_read and stack.count > 0 and not EXCLUDED_CHEST_ITEM_NAMES[stack.name] then
       local item_proto = stack.prototype
       if item_proto then
         local ent_proto = item_proto.place_result
@@ -311,12 +481,28 @@ local function move_some(stack, dst, name)
   local can = inv.get_insertable_count(name)
   if can <= 0 then return 0 end
   local put = math.min(count, can)
-  local inserted = inv.insert{name=name, count=put}
+
+  -- Preserve metadata for stack_size=1 items (blueprints, planners, item-with-tags, etc.)
+  local stack_size = (stack.prototype and stack.prototype.stack_size) or count
+  if stack_size == 1 then
+    local ok_dst, dst_stack = pcall(function()
+      return inv.find_empty_stack({ name = name })
+    end)
+    if ok_dst and dst_stack and dst_stack.valid then
+      local ok_transfer, transferred = pcall(function()
+        return dst_stack.transfer_stack(stack)
+      end)
+      if ok_transfer and transferred then
+        return 1
+      end
+    end
+  end
+
+  local inserted = inv.insert{ name = name, count = put }
   if inserted > 0 then
     stack.count = count - inserted
-    return inserted
   end
-  return 0
+  return inserted
 end
 
 -- === Pull from Areas into player (prefer cursor) ===========================
@@ -414,22 +600,32 @@ local function push_from_player_into_areas(player, item_name, want_count, precol
     local can_insert = dst_inv.get_insertable_count(item_name)
     if can_insert <= 0 then break end
 
-    local to_take = math.min(remaining, can_insert, inv.get_item_count(item_name))
-    if to_take <= 0 then break end
+    local stack_size = (prototypes and prototypes.item and prototypes.item[item_name] and prototypes.item[item_name].stack_size) or nil
+    if stack_size == 1 then
+      local src_stack = inv.find_item_stack({ name = item_name })
+      local dst_stack = dst_inv.find_empty_stack({ name = item_name })
+      if not (src_stack and src_stack.valid_for_read and dst_stack and dst_stack.valid) then break end
+      if not dst_stack.transfer_stack(src_stack) then break end
+      moved = moved + 1
+      remaining = want_count - moved
+    else
+      local to_take = math.min(remaining, can_insert, inv.get_item_count(item_name))
+      if to_take <= 0 then break end
 
-    local removed = inv.remove{name = item_name, count = to_take}
-    if removed <= 0 then break end
+      local removed = inv.remove{ name = item_name, count = to_take }
+      if removed <= 0 then break end
 
-    local inserted = dst_inv.insert{name = item_name, count = removed}
-    if inserted < removed then
-      local returned = inv.insert{name = item_name, count = removed - inserted}
-      if returned < (removed - inserted) then
-        player.surface.spill_item_stack(player.position, {name = item_name, count = removed - inserted - returned}, true, player.force, false)
+      local inserted = dst_inv.insert{ name = item_name, count = removed }
+      if inserted < removed then
+        local returned = inv.insert{ name = item_name, count = removed - inserted }
+        if returned < (removed - inserted) then
+          player.surface.spill_item_stack(player.position, { name = item_name, count = removed - inserted - returned }, true, player.force, false)
+        end
       end
-    end
 
-    moved = moved + inserted
-    remaining = want_count - moved
+      moved = moved + inserted
+      remaining = want_count - moved
+    end
   end
 
   local cs = player.cursor_stack
@@ -445,15 +641,24 @@ local function push_from_player_into_areas(player, item_name, want_count, precol
       local can_insert = dst_inv.get_insertable_count(item_name)
       if can_insert <= 0 then break end
 
-      local to_move = math.min(cursor_remaining, can_insert, want_count - moved)
-      if to_move <= 0 then break end
+      local stack_size = (cs.prototype and cs.prototype.stack_size) or cursor_remaining
+      if stack_size == 1 then
+        local dst_stack = dst_inv.find_empty_stack({ name = item_name })
+        if not (dst_stack and dst_stack.valid) then break end
+        if not dst_stack.transfer_stack(cs) then break end
+        cursor_remaining = 0
+        moved = moved + 1
+      else
+        local to_move = math.min(cursor_remaining, can_insert, want_count - moved)
+        if to_move <= 0 then break end
 
-      local inserted = dst_inv.insert{name = item_name, count = to_move}
-      if inserted <= 0 then break end
+        local inserted = dst_inv.insert{ name = item_name, count = to_move }
+        if inserted <= 0 then break end
 
-      cs.count = cs.count - inserted
-      cursor_remaining = cursor_remaining - inserted
-      moved = moved + inserted
+        cs.count = cs.count - inserted
+        cursor_remaining = cursor_remaining - inserted
+        moved = moved + inserted
+      end
     end
   end
   return moved
@@ -465,6 +670,7 @@ ChestSorter.get_player_areas = get_player_areas
 ChestSorter.player_main_inventory = player_main_inventory
 ChestSorter.inv_plus_cursor_count = inv_plus_cursor_count
 ChestSorter.collect_area_chests = collect_area_chests
+ChestSorter.queue_request_refresh = queue_request_refresh
 ChestSorter.pull_from_areas_into_player_preferring_cursor = pull_from_areas_into_player_preferring_cursor
 ChestSorter.push_from_player_into_areas = push_from_player_into_areas
 
@@ -481,7 +687,7 @@ local function sort_from_source(player, source)
 
   -- Sort the pointed chest into the selected areas.
   local target_areas = areas
-  local chests = collect_area_chests_in_areas(player, target_areas, source)
+  local chests = get_cached_area_chests(player, target_areas, source)
 
   local pools = build_pools(chests)
   local moved_stacks = 0
@@ -575,11 +781,10 @@ script.on_event(defines.events.on_player_selected_area, function(e)
 
   local bucket = ensure_player_areas(player)
   bucket.list = { { area = e.area, surface_index = player.surface.index } }
+  mark_player_chest_cache_dirty(player)
   local w,h = rect_size(e.area)
   player.print({"message.area-set", w, h})
-  if Requests and Requests.process then
-    Requests.process(player)
-  end
+  queue_request_refresh(player)
 end)
 
 -- Selection tool (Shift-drag): add area
@@ -590,11 +795,10 @@ script.on_event(defines.events.on_player_alt_selected_area, function(e)
 
   local bucket = ensure_player_areas(player)
   table.insert(bucket.list, { area = e.area, surface_index = player.surface.index })
+  mark_player_chest_cache_dirty(player)
   local w,h = rect_size(e.area)
   player.print({"message.area-added", w, h, #bucket.list})
-  if Requests and Requests.process then
-    Requests.process(player)
-  end
+  queue_request_refresh(player)
 end)
 
 local function process_item_name(player, item_name)
@@ -604,6 +808,25 @@ local function process_item_name(player, item_name)
     Requests.process_item(player, item_name)
   elseif Requests and Requests.process then
     Requests.process(player)
+  end
+end
+
+local function refresh_request_for_item_immediate(player, item_name)
+  if not (player and player.valid and player.character) then return end
+  if type(item_name) ~= "string" or item_name == "" then return end
+
+  storage.cursor_refresh_guard = storage.cursor_refresh_guard or {}
+  local guard = storage.cursor_refresh_guard[player.index]
+  if guard and guard[item_name] == game.tick then return end
+  storage.cursor_refresh_guard[player.index] = guard or {}
+  storage.cursor_refresh_guard[player.index][item_name] = game.tick
+
+  process_item_name(player, item_name)
+
+  local queue = storage.requests_queue
+  local bucket = queue and queue[player.index] or nil
+  if bucket and not bucket.full and bucket.item_name == item_name then
+    queue[player.index] = nil
   end
 end
 
@@ -634,9 +857,7 @@ script.on_event(defines.events.on_player_trash_inventory_changed, function(e)
   if g[e.player_index] == game.tick then return end
   g[e.player_index] = game.tick
   dump_trash_to_areas(player)
-  if Requests and Requests.process then
-    Requests.process(player, true)
-  end
+  queue_request_refresh(player, nil, true)
 end)
 
 script.on_event(defines.events.on_player_crafted_item, function(e)
@@ -644,7 +865,7 @@ script.on_event(defines.events.on_player_crafted_item, function(e)
   if not (player and player.valid and player.character) then return end
   local item_stack = e.item_stack
   if item_stack and item_stack.valid_for_read then
-    process_item_name(player, item_stack.name)
+    queue_request_refresh(player, item_stack.name)
   end
 end)
 
@@ -653,7 +874,7 @@ script.on_event(defines.events.on_player_mined_item, function(e)
   if not (player and player.valid and player.character) then return end
   local item_stack = e.item_stack
   if item_stack and item_stack.valid_for_read then
-    process_item_name(player, item_stack.name)
+    queue_request_refresh(player, item_stack.name)
   end
 end)
 
@@ -662,7 +883,7 @@ script.on_event(defines.events.on_picked_up_item, function(e)
   if not (player and player.valid and player.character) then return end
   local item_stack = e.item_stack
   if item_stack and item_stack.valid_for_read then
-    process_item_name(player, item_stack.name)
+    queue_request_refresh(player, item_stack.name)
   end
 end)
 
@@ -670,54 +891,85 @@ script.on_event(defines.events.on_player_pipette, function(e)
   local player = game.get_player(e.player_index)
   if not (player and player.valid and player.character) then return end
   local item = e.item
-  process_item_name(player, item and item.name or nil)
+  if item and item.name then
+    refresh_request_for_item_immediate(player, item.name)
+  else
+    queue_request_refresh(player)
+  end
 end)
 
 script.on_event(defines.events.on_player_used_capsule, function(e)
   local player = game.get_player(e.player_index)
   if not (player and player.valid and player.character) then return end
   local item = e.item
-  process_item_name(player, item and item.name or nil)
+  queue_request_refresh(player, item and item.name or nil)
 end)
 
 -- Event-driven refills for requests (no timers): trigger on relevant changes
 script.on_event(defines.events.on_player_main_inventory_changed, function(e)
   local player = game.get_player(e.player_index)
   if not (player and player.valid and player.character) then return end
-  if Requests and Requests.process then
-    Requests.process(player)
-  end
+  queue_request_refresh(player)
 end)
 
 script.on_event(defines.events.on_player_cursor_stack_changed, function(e)
   local player = game.get_player(e.player_index)
   if not (player and player.valid and player.character) then return end
-  if Requests and Requests.process then
-    local cursor_stack = player.cursor_stack
-    if cursor_stack and cursor_stack.valid_for_read then
-      if Requests.process_item then
-        Requests.process_item(player, cursor_stack.name)
-      else
-        Requests.process(player)
-      end
-    else
-      Requests.process(player)
-    end
+  local cursor_stack = player.cursor_stack
+  if cursor_stack and cursor_stack.valid_for_read then
+    refresh_request_for_item_immediate(player, cursor_stack.name)
+  else
+    queue_request_refresh(player)
   end
 end)
 
 script.on_event(defines.events.on_built_entity, function(e)
   local player = e.player_index and game.get_player(e.player_index) or nil
   if not (player and player.valid and player.character) then return end
+  cache_chest_for_player(player, e.entity or e.created_entity)
   process_consumed_items(player, e.consumed_items)
+end)
+
+script.on_event(defines.events.on_robot_built_entity, function(e)
+  local entity = e.entity
+  if not (entity and entity.valid) then return end
+  for _, player in pairs(game.players) do
+    if player and player.valid then
+      cache_chest_for_player(player, entity)
+    end
+  end
+end)
+
+script.on_event(defines.events.script_raised_built, function(e)
+  local entity = e.entity
+  if not (entity and entity.valid) then return end
+  for _, player in pairs(game.players) do
+    if player and player.valid then
+      cache_chest_for_player(player, entity)
+    end
+  end
+end)
+
+script.on_event(defines.events.on_player_mined_entity, function(e)
+  forget_chest_from_all_caches(e.entity)
+end)
+
+script.on_event(defines.events.on_robot_mined_entity, function(e)
+  forget_chest_from_all_caches(e.entity)
+end)
+
+script.on_event(defines.events.on_entity_died, function(e)
+  forget_chest_from_all_caches(e.entity)
+end)
+
+script.on_event(defines.events.script_raised_destroy, function(e)
+  forget_chest_from_all_caches(e.entity)
 end)
 
 script.on_event(defines.events.on_player_fast_transferred, function(e)
   local player = game.get_player(e.player_index)
   if not (player and player.valid and player.character) then return end
-  if Requests and Requests.process then
-    Requests.process(player, true)
-  end
+  queue_request_refresh(player, nil, true)
 end)
 
 script.on_event(defines.events.on_gui_click, function(e)
